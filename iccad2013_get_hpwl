@@ -1,0 +1,429 @@
+#!/usr/bin/perl
+
+# ------------------------------------------------------------------------------
+# Author: 
+#   Natarajan Viswanathan, IBM Corporation (nviswan@us.ibm.com)
+# Description: 
+#   Compute the Total Half-Perimeter Wire Length of the placement solution
+# Usage: 
+#   iccad2013_get_hpwl <circuit.aux> <solution.pl>
+# ------------------------------------------------------------------------------
+#   (1) This script assumes that all nodes are placed in their default 
+#       orientation, which is N. 
+#   (2) For the ICCAD 2013 contest, flipping / mirroring / rotation of the 
+#       nodes is NOT allowed
+# ------------------------------------------------------------------------------
+
+use strict;
+use File::Basename;
+
+my $MAX_VAL = 100000000;
+my $MIN_VAL = -100000000;
+# Indices for node attributes in ObjectDB
+my $XLOWINDEX = 0;
+my $YLOWINDEX = 1;
+my $DXINDEX   = 2;
+my $DYINDEX   = 3;
+my $TYPEINDEX = 4;
+
+{
+my %DesignDB;         # Benchmark file information
+my %ObjectDB;         # Node information
+my %NetDB;            # Netlist information
+
+my $aux_file = $ARGV[0];
+my $sol_file = $ARGV[1];
+
+die "Usage: $0 <circuit.aux> <solution.pl>\n"
+unless(defined($aux_file) && defined($sol_file));
+
+# Handle compressed solution files
+if($sol_file =~ /\.gz$/)
+{
+  $sol_file = "gunzip -c $sol_file |";
+}
+elsif($sol_file =~ /\.bz2$/)
+{
+  $sol_file = "bunzip2 -c $sol_file |";
+}
+
+read_aux_file($aux_file, \%DesignDB);
+read_nodes_file($DesignDB{nodes}, \%ObjectDB);
+read_pl_file($DesignDB{pl}, \%ObjectDB);
+read_solution_pl_file($sol_file, \%ObjectDB);
+read_nets_file($DesignDB{nets}, \%ObjectDB, \%NetDB);
+
+print "-----------------------------------------------------\n";
+print " Total Half Perimeter Wire Length: $NetDB{tot_wl}\n";
+print "-----------------------------------------------------\n";
+}
+
+###########################
+# .aux file processing
+###########################
+sub read_aux_file {
+  my ($aux_file, $ref_DesignDB) = @_;
+  my ($filename, $dir) = fileparse($aux_file);
+  
+  open(AUXFILE, $aux_file) or die "Can't open: $aux_file ($!)\n";
+  
+  while(<AUXFILE>) {
+    $_ = process_line($_);
+    if(/^(RowBasedPlacement)/)
+    {
+      my @temp = split;
+      $ref_DesignDB->{nodes}  = $dir . $temp[2];
+      $ref_DesignDB->{nets}   = $dir . $temp[3];
+      $ref_DesignDB->{wts}    = $dir . $temp[4];
+      $ref_DesignDB->{pl}     = $dir . $temp[5];
+      $ref_DesignDB->{scl}    = $dir . $temp[6];
+      $ref_DesignDB->{shapes} = $dir . $temp[7];
+      $ref_DesignDB->{route}  = $dir . $temp[8];
+      last;
+    }
+    else
+    {
+      next;
+    }
+  }
+  
+  close(AUXFILE);
+}
+
+###################################
+# .nodes file processing
+##################################
+sub read_nodes_file {
+  my ($nodes_file, $ref_ObjectDB) = @_;
+  my ($temp, @temp, $movetype);
+  
+  print "Phase 1: .nodes file\n";
+  
+  open(NODESFILE, $nodes_file) or die "Can't open: $nodes_file ($!)\n";
+  
+  my $num_node_records = 0;
+  my $fixed = 0;
+  my $nifixed = 0;
+  while(<NODESFILE>)
+  {
+    $_ = process_line($_);
+    if(/^(UCLA)/ or /^\s*$/ or /^#.*/)
+    {
+      next;
+    }
+    elsif(/^(NumNodes)/)
+    {
+      ($temp, $ref_ObjectDB->{num_nodes}) = split ":";
+      $ref_ObjectDB->{num_nodes} = process_line($ref_ObjectDB->{num_nodes});
+    }
+    elsif(/^(NumTerminals)/)
+    {
+      ($temp, $ref_ObjectDB->{num_terminals}) = split ":";
+      $ref_ObjectDB->{num_terminals} = process_line($ref_ObjectDB->{num_terminals});
+    }
+    else
+    {
+      $num_node_records++;
+      @temp = split;
+      if($temp[3] =~ /(terminal_NI)/)
+      {
+        $movetype = "terminal_NI";
+        $nifixed++;
+      }
+      elsif($temp[3] =~ /(terminal)/)
+      {
+        $movetype = "terminal";
+        $fixed++;
+      }
+      else
+      {
+        $movetype = "movable";
+      }
+      # (xlow, ylow, width, height, movetype)
+      my @tmpRecord = (0, 0, $temp[1], $temp[2], $movetype);
+      $ref_ObjectDB->{obj_record}{$temp[0]} = \@tmpRecord;
+    }
+  }
+  
+  close(NODESFILE);
+  
+  $ref_ObjectDB->{movable_nodes} = $ref_ObjectDB->{num_nodes} - $ref_ObjectDB->{num_terminals};
+  $ref_ObjectDB->{fixed_nodes}   = $fixed;
+  $ref_ObjectDB->{nifixed_nodes} = $nifixed;
+  
+  die "NumNodes($ref_ObjectDB->{num_nodes}) does not match Num_Node_Records($num_node_records)\n"
+  if($num_node_records != $ref_ObjectDB->{num_nodes});
+  
+  if($ref_ObjectDB->{num_terminals} != $ref_ObjectDB->{fixed_nodes}+$ref_ObjectDB->{nifixed_nodes})
+  {
+    my $temp_str = "NumTerminals($ref_ObjectDB->{num_terminals}) does not match ".
+                   "Terminal($ref_ObjectDB->{fixed_nodes})+Terminal_NI($ref_ObjectDB->{nifixed_nodes})\n";
+    die "$temp_str";
+  }
+  
+  print "         Total Nodes             : $ref_ObjectDB->{num_nodes}\n";
+  print "         Movable Nodes           : $ref_ObjectDB->{movable_nodes}\n";
+  print "         Terminal Nodes          : $ref_ObjectDB->{num_terminals}\n";
+  print "         Fixed Terminal Nodes    : $ref_ObjectDB->{fixed_nodes}\n";
+  print "         Fixed_NI Terminal Nodes : $ref_ObjectDB->{nifixed_nodes}\n";
+}
+
+###################################
+# .pl file processing
+##################################
+sub read_pl_file {
+  my ($pl_file, $ref_ObjectDB) = @_;
+  my ($temp_ct, @temp);
+  
+  print "Phase 2: .pl file\n";
+  
+  open(PLFILE, $pl_file) or die "Can't open: $pl_file ($!)\n";
+  
+  my $num_loc_records = 0;
+  while(<PLFILE>)
+  {
+    $_ = process_line($_);
+    if(/^(UCLA)/ or /^\s*$/ or /^#.*/)
+    {
+      next;
+    }
+    else
+    {
+      $num_loc_records++;
+      @temp = split;
+      $temp_ct = @temp;
+      die "Invalid node ($temp[0]) in .pl file\n" 
+      if(!defined($ref_ObjectDB->{obj_record}{$temp[0]}));
+      
+      # do not worry about node orientation for now, as all nodes 
+      # should have default orientation (no flipping / rotation allowed)
+      ${$ref_ObjectDB->{obj_record}{$temp[0]}}[$XLOWINDEX] = $temp[1];
+      ${$ref_ObjectDB->{obj_record}{$temp[0]}}[$YLOWINDEX] = $temp[2];
+      
+      if($temp[$temp_ct-1] =~ /(FIXED_NI)/)
+      {
+        die "Movetype mismatch for node: $temp[0]\n"
+        if(${$ref_ObjectDB->{obj_record}{$temp[0]}}[$TYPEINDEX] ne "terminal_NI");
+      }
+      elsif($temp[$temp_ct-1] =~ /(FIXED)/)
+      {
+        die "Movetype mismatch for node: $temp[0]\n"
+        if(${$ref_ObjectDB->{obj_record}{$temp[0]}}[$TYPEINDEX] ne "terminal");
+      }
+      else
+      {
+        die "Movetype mismatch for node: $temp[0]\n"
+        if(${$ref_ObjectDB->{obj_record}{$temp[0]}}[$TYPEINDEX] ne "movable");
+      }
+    }
+  }
+  
+  close(PLFILE);
+  
+  die "NumNodes($ref_ObjectDB->{num_nodes}) does not match Num_Loc_Records($num_loc_records)\n"
+  if($ref_ObjectDB->{num_nodes} != $num_loc_records);
+  
+  print "         Total Nodes  : $num_loc_records\n";
+}
+
+###################################
+# solution .pl file processing
+##################################
+sub read_solution_pl_file {
+  my ($pl_file, $ref_ObjectDB) = @_;
+  my (@temp);
+  
+  print "Phase 3: solution .pl ($pl_file) file\n";
+  
+  open(PLFILE, $pl_file) or die "Can't open: $pl_file ($!)\n";
+  
+  my $num_loc_records = 0;
+  my $num_mov_records = 0;
+  while(<PLFILE>)
+  {
+    $_ = process_line($_);
+    if(/^(UCLA)/ or /^\s*$/ or /^#.*/)
+    {
+      next;
+    }
+    else
+    {
+      $num_loc_records++;
+      @temp = split;
+      die "Invalid node ($temp[0]) in solution .pl file\n" 
+      if(!defined($ref_ObjectDB->{obj_record}{$temp[0]}));
+      
+      # Get only the movable node coordinates from the solution file
+      if(${$ref_ObjectDB->{obj_record}{$temp[0]}}[$TYPEINDEX] eq "movable")
+      {
+        $num_mov_records++;
+        ${$ref_ObjectDB->{obj_record}{$temp[0]}}[$XLOWINDEX] = $temp[1];
+        ${$ref_ObjectDB->{obj_record}{$temp[0]}}[$YLOWINDEX] = $temp[2];
+      }
+    }
+  }
+  
+  close(PLFILE);
+  
+  die "NumNodes($ref_ObjectDB->{num_nodes}) does not match Num_Loc_Records($num_loc_records)\n"
+  if($ref_ObjectDB->{num_nodes} != $num_loc_records);
+  
+  die "MovableNodes($ref_ObjectDB->{movable_nodes}) does not match Num_Mov_Records($num_mov_records)\n"
+  if($ref_ObjectDB->{movable_nodes} != $num_mov_records);
+  
+  print "         Movable Nodes: $num_mov_records\n";
+}
+
+###########################
+# .nets file processing
+###########################
+sub read_nets_file {
+  my ($nets_file, $ref_ObjectDB, $ref_NetDB) = @_;
+  my ($temp, $temp_ct, @temp);
+  
+  print "Phase 4: .nets file\n";
+  
+  open(NETSFILE, $nets_file) or die "Can't open: $nets_file ($!)\n";
+  
+  $ref_NetDB->{tot_wl} = 0;
+  
+  my $num_net_record = 0;
+  my $num_pin_record = 0;
+  while(<NETSFILE>)
+  {
+    $_ = process_line($_);
+    if(/^(UCLA)/ or /^\s*$/ or /^#.*/)
+    {
+      next;
+    }
+    elsif(/^(NumNets)/)
+    {
+      ($temp, $ref_NetDB->{num_nets}) = split ":";
+      $ref_NetDB->{num_nets} = process_line($ref_NetDB->{num_nets});
+    }
+    elsif(/^(NumPins)/)
+    {
+      ($temp, $ref_NetDB->{num_pins}) = split ":";
+      $ref_NetDB->{num_pins} = process_line($ref_NetDB->{num_pins});
+    }
+    elsif(/^(NetDegree)/)
+    {
+      @temp = split;
+      $temp_ct = @temp;
+      my $degree = $temp[2];
+      my $net_name;
+      if($temp_ct < 4)
+      {
+        $net_name = "noname_net_$num_net_record";
+      }
+      else
+      {
+        $net_name = $temp[3];
+      }
+      $ref_NetDB->{net_record}{$net_name}{degree} = $degree;
+      $ref_NetDB->{net_record}{$net_name}{index}  = $num_net_record;
+      my $pin_id = 0;
+      my %pins;
+      my $this_net_lx = $MAX_VAL;
+      my $this_net_ly = $MAX_VAL;
+      my $this_net_hx = $MIN_VAL;
+      my $this_net_hy = $MIN_VAL;
+      while(<NETSFILE>)
+      {
+        $_ = process_line($_);
+        if(/^\s*$/ or /^#.*/)
+        {
+          next;
+        }
+        else
+        {
+          $pin_id++;
+          # assume line is: o464240   O  :     -1.0000      0.5000
+          @temp = split;
+          die "Invalid object ($temp[0]) in .nets file\n"
+          if(!defined($ref_ObjectDB->{obj_record}{$temp[0]}));
+          
+          my $obj_lx = ${$ref_ObjectDB->{obj_record}{$temp[0]}}[$XLOWINDEX];
+          my $obj_ly = ${$ref_ObjectDB->{obj_record}{$temp[0]}}[$YLOWINDEX];
+          my $obj_dx = ${$ref_ObjectDB->{obj_record}{$temp[0]}}[$DXINDEX];
+          my $obj_dy = ${$ref_ObjectDB->{obj_record}{$temp[0]}}[$DYINDEX];
+          my $pin_x  = $obj_lx + ($obj_dx/2) + $temp[3];
+          my $pin_y  = $obj_ly + ($obj_dy/2) + $temp[4];
+          $pin_x = round_up_int($pin_x);
+          $pin_y = round_up_int($pin_y);
+          
+          my @tmpPinRecord = ($temp[0], $pin_x, $pin_y);
+          $pins{$pin_id} = \@tmpPinRecord;
+          
+          $this_net_lx = $pin_x if($pin_x < $this_net_lx);
+          $this_net_ly = $pin_y if($pin_y < $this_net_ly);
+          $this_net_hx = $pin_x if($pin_x > $this_net_hx);
+          $this_net_hy = $pin_y if($pin_y > $this_net_hy);
+          
+          last if($pin_id == $degree);
+        }
+      }
+      
+      $num_pin_record += $pin_id;
+      my $this_net_wl = (($this_net_hx - $this_net_lx) + ($this_net_hy - $this_net_ly));
+      die "Net ($net_name) has negative HPWL ($this_net_wl)\n"
+      if($this_net_wl < 0);
+      
+      $ref_NetDB->{net_record}{$net_name}{net_pins} = \%pins;
+      $ref_NetDB->{tot_wl} += $this_net_wl;
+      $num_net_record++;
+    }
+    else
+    {
+      next;
+    }
+  }
+  
+  close(NETSFILE);
+  
+  die "NumNets($ref_NetDB->{num_nets}) does not match Num_Net_Records($num_net_record)\n"
+  if($ref_NetDB->{num_nets} != $num_net_record);
+  
+  die "NumPins($ref_NetDB->{num_pins}) does not match Num_Pin_Records($num_pin_record)\n"
+  if($ref_NetDB->{num_pins} != $num_pin_record);
+  
+  print "         Total Nets         : $ref_NetDB->{num_nets}\n";
+  print "         Total Pins         : $ref_NetDB->{num_pins}\n";
+}
+
+sub process_line {
+  my $line = $_[0];
+  chomp $line;
+  $line =~ s/^\s+//;
+  $line =~ s/\s+$//;
+  
+  return $line;
+}
+
+sub min {
+  if($_[0] < $_[1])
+  {
+    return $_[0];
+  }
+  else
+  {
+    return $_[1];
+  }
+}
+
+sub max {
+  if($_[0] > $_[1])
+  {
+    return $_[0];
+  }
+  else
+  {
+    return $_[1];
+  }
+}
+
+sub round_up_int {
+  my $arg = $_[0];
+  $arg += 0.5;
+  return int($arg);
+}
